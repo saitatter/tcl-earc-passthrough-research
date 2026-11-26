@@ -70,6 +70,7 @@ void __cfi_check(u64 id, void *ptr, void *diag) { (void)id; (void)ptr; (void)dia
 #define MAT_SYNC_W0        0x4e1ff872U   /* LE u32: Pa=0xF872, Pb=0x4E1F */
 #define MAT_SYNC_W1        0xeff00016U   /* LE u32: Pc=0x0016 (MAT), Pd=0xEFF0 (61,424 B) */
 #define MIN_VALID_SLOTS    16U
+#define REPLACE_WINDOW_NS  1500000ULL    /* 1.5 ms conservative write deadline from last sentinel observation */
 
 /* Vivaldi3 (0x950300) & eARC Digital TX cfg (0x951100) MMIO windows from runtime FDT */
 #define VIVALDI3_PHYS      0x1D2A0600ULL
@@ -105,7 +106,7 @@ struct earc_mat_status {
     u32 already_ready;
     u32 relocks;
     u32 ring_active;
-    u32 reserved;
+    u32 header_changes;
 };
 
 static volatile u8 *g_ring;
@@ -142,6 +143,7 @@ static u64 g_last_slot_ns;
 static u32 g_underruns;
 static u32 g_already_ready;
 static u32 g_relocks;
+static u32 g_header_changes;
 
 static inline void dsp_wmb(void)
 {
@@ -178,6 +180,13 @@ static inline u32 ring_read32(u32 off)
 static inline void ring_write32(u32 off, u32 val)
 {
     *(volatile u32 *)(g_ring + off) = val;
+}
+
+static inline int slot_has_mat_header(u32 s)
+{
+    u32 off = slot_start_off(s);
+    return ring_read32(off) == MAT_SYNC_W0 &&
+           ring_read32((off + 4U) % (u32)RING_SIZE) == MAT_SYNC_W1;
 }
 
 static void copy_blocks64(u8 *dst, const u8 *src, u32 bytes)
@@ -334,7 +343,7 @@ static int mat_pump_thread(void *arg)
 
     int locked = g_prelocked;
     int started = 0;
-    unsigned long target_lead_us = 15000UL; /* 15.0ms initial sleep leaves 5.0ms CPUIDLE wake margin for zero already_ready */
+    unsigned long target_lead_us = 17500UL; /* 17.5ms initial sleep leaves 2.5ms SCHED_FIFO margin (auto-backs off on late) */
 
     if (locked) {
         _printk("\0016[tcl_earc_mat] pump locked (SCHED_FIFO): base_off=0x%x next_slot=%u\n",
@@ -360,9 +369,11 @@ static int mat_pump_thread(void *arg)
         }
 
         u32 end_off = slot_end_off(g_next_slot);
+        u64 sample_ns = (u64)ktime_get();
         dsp_rmb();
         int ready = 0;
         int was_late = 0;
+        u64 replace_before_ns = 0;
         if (ring_read32(end_off) != SENTINEL) {
             __atomic_fetch_add(&g_already_ready, 1U, __ATOMIC_RELAXED);
             ready = 1;
@@ -370,13 +381,17 @@ static int mat_pump_thread(void *arg)
             if (target_lead_us > 12000UL)
                 target_lead_us -= 500UL;
         } else {
+            u64 marker_seen_ns = sample_ns;
             for (u32 t = 0; t < 400 && !g_stop_req; t++) {
                 usleep_range_state(200, 280, TASK_IDLE);
+                sample_ns = (u64)ktime_get();
                 dsp_rmb();
                 if (ring_read32(end_off) != SENTINEL) {
+                    replace_before_ns = marker_seen_ns + REPLACE_WINDOW_NS;
                     ready = 1;
                     break;
                 }
+                marker_seen_ns = sample_ns;
             }
         }
 
@@ -389,6 +404,11 @@ static int mat_pump_thread(void *arg)
             continue;
         }
 
+        if (!earc_hw_npcm_active()) {
+            _printk("\0016[tcl_earc_mat] eARC NPCM2 became inactive; stopping pump\n");
+            break;
+        }
+
         u64 flip_ns = (u64)ktime_get();
 
         u32 tail = __atomic_load_n(&g_q_tail, __ATOMIC_RELAXED);
@@ -396,16 +416,28 @@ static int mat_pump_thread(void *arg)
         __atomic_store_n(&g_pump_committing, 1, __ATOMIC_SEQ_CST);
         int paused = __atomic_load_n(&g_paused, __ATOMIC_SEQ_CST);
         if (!paused && tail != head) {
-            const u8 *src = g_q_buf + (u64)(tail & Q_MASK) * SLOT_SIZE;
-            ring_write_slot(g_next_slot, src);
-            u32 next_tail = tail + 1U;
-            __atomic_store_n(&g_q_tail, next_tail, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_last_slot_ns, flip_ns, __ATOMIC_RELEASE);
-            __atomic_fetch_add(&g_frames_out, 1ULL, __ATOMIC_RELEASE);
-            signal_binary_comp(&g_space_comp);
-            if (next_tail == head)
-                signal_binary_comp(&g_drain_comp);
-            started = 1;
+            /* Verify live MAT header before checking the final write deadline */
+            if (!slot_has_mat_header(g_next_slot)) {
+                __atomic_fetch_add(&g_header_changes, 1U, __ATOMIC_RELAXED);
+            } else if (was_late || !replace_before_ns || (u64)ktime_get() > replace_before_ns) {
+                if (!was_late) {
+                    __atomic_fetch_add(&g_already_ready, 1U, __ATOMIC_RELAXED);
+                    was_late = 1;
+                    if (target_lead_us > 12000UL)
+                        target_lead_us -= 500UL;
+                }
+            } else {
+                const u8 *src = g_q_buf + (u64)(tail & Q_MASK) * SLOT_SIZE;
+                ring_write_slot(g_next_slot, src);
+                u32 next_tail = tail + 1U;
+                __atomic_store_n(&g_q_tail, next_tail, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_last_slot_ns, flip_ns, __ATOMIC_RELEASE);
+                __atomic_fetch_add(&g_frames_out, 1ULL, __ATOMIC_RELEASE);
+                signal_binary_comp(&g_space_comp);
+                if (next_tail == head)
+                    signal_binary_comp(&g_drain_comp);
+                started = 1;
+            }
         } else if (!paused) {
             signal_binary_comp(&g_drain_comp);
             if (started) {
@@ -496,6 +528,7 @@ static int dev_open(struct inode *inode, struct file *filp)
     g_underruns = 0;
     g_already_ready = 0;
     g_relocks = 0;
+    g_header_changes = 0;
     g_stop_req = 0;
     g_prelocked = 0;
     g_space_comp.done = 0;
@@ -536,8 +569,8 @@ static int dev_release(struct inode *inode, struct file *filp)
     /* Stop immediately on close() so pause/seek silences within <20ms */
     stop_pump_and_wait();
 
-    _printk("\0016[tcl_earc_mat] closed: frames=%llu underruns=%u already_ready=%u relocks=%u\n",
-            (unsigned long long)g_frames_out, g_underruns, g_already_ready, g_relocks);
+    _printk("\0016[tcl_earc_mat] closed: frames=%llu underruns=%u already_ready=%u relocks=%u header_changes=%u\n",
+            (unsigned long long)g_frames_out, g_underruns, g_already_ready, g_relocks, g_header_changes);
     *(void **)((u8 *)filp + FILE_OFF_PRIV) = (void *)0;
     __atomic_store_n(&g_open, 0, __ATOMIC_RELEASE);
     return 0;
@@ -586,7 +619,7 @@ static ssize_t dev_read_iter(struct kiocb *iocb, struct iov_iter *to)
     st.already_ready     = __atomic_load_n(&g_already_ready, __ATOMIC_RELAXED);
     st.relocks           = __atomic_load_n(&g_relocks, __ATOMIC_RELAXED);
     st.ring_active       = (__atomic_load_n(&g_thread_alive, __ATOMIC_ACQUIRE) && earc_hw_npcm_active()) ? 1U : 0U;
-    st.reserved          = 0U;
+    st.header_changes    = __atomic_load_n(&g_header_changes, __ATOMIC_RELAXED);
 
     size_t copied = _copy_to_iter(&st, sizeof(st), to);
     return (ssize_t)copied;

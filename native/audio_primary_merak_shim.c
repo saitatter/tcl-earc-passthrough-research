@@ -102,7 +102,7 @@ struct earc_mat_status {
     uint32_t already_ready;
     uint32_t relocks;
     uint32_t ring_active;
-    uint32_t reserved;
+    uint32_t header_changes;
 };
 
 /* Minimal 32-bit AOSP hardware/hardware.h + hardware/audio.h ABI (verified against audio.primary.merak.so) */
@@ -224,6 +224,7 @@ struct mat_stream_out {
     uint32_t last_k_underruns;
     uint32_t last_k_late;
     uint32_t last_k_relocks;
+    uint32_t last_k_hdr_changes;
     int in_write;                /* >0 while blocking write()/fsync() runs unlocked */
     int paused;
     int started;
@@ -332,8 +333,9 @@ static void mat_poll_kernel_status_locked(struct mat_stream_out *m)
             m->last_hw_sync_ns = st.last_slot_mono_ns;
         m->last_k_qdepth    = st.q_depth;
         m->last_k_underruns = st.underruns;
-        m->last_k_late      = st.already_ready;
-        m->last_k_relocks   = st.relocks;
+        m->last_k_late        = st.already_ready;
+        m->last_k_relocks     = st.relocks;
+        m->last_k_hdr_changes = st.header_changes;
     } else if (r < 0 && (errno == EACCES || errno == EBADF || errno == EINVAL)) {
         m->can_read_status = 0;
     }
@@ -900,9 +902,9 @@ static int mat_dump(const struct audio_stream *s, int fd)
     dprintf(fd, "    written_frames=%llu presented_frames=%llu mat_bursts=%u skips=%u\n",
             (unsigned long long)m->written_frames, (unsigned long long)pres,
             m->mat_bursts_emitted, m->resync_skips);
-    dprintf(fd, "    kernel: pumped=%llu q_depth=%u underruns=%u already_ready=%u relocks=%u\n",
+    dprintf(fd, "    kernel: pumped=%llu q_depth=%u underruns=%u already_ready=%u relocks=%u hdr_chg=%u\n",
             (unsigned long long)m->hw_consumed_bursts, m->last_k_qdepth,
-            m->last_k_underruns, m->last_k_late, m->last_k_relocks);
+            m->last_k_underruns, m->last_k_late, m->last_k_relocks, m->last_k_hdr_changes);
     pthread_mutex_unlock(&m->lock);
     return 0;
 }
@@ -1092,23 +1094,30 @@ static char *shim_get_parameters(const struct audio_hw_device *dev, const char *
     return res;
 }
 
-/* Stateless <5 us hardware/ring probe: never conflicts with active stream (-EBUSY treated as active) */
-static int is_earc_mat_ring_available(void)
+/* Stateless <5 us hardware/ring probe: never conflicts with active stream (-EBUSY treated as active).
+   When targeting HDMI_EARC, retry briefly on -ENODEV to ride out transient DSP/eARC init windows. */
+static int is_earc_mat_ring_available(uint32_t devices)
 {
-    int pfd = open(BYPASS_DEV, O_RDONLY);
-    if (pfd >= 0) {
-        close(pfd);
-        return 1;
-    }
-    if (errno == EACCES || errno == EPERM) {
-        pfd = open(BYPASS_DEV, O_WRONLY);
+    int max_tries = (devices == AUDIO_DEVICE_OUT_HDMI_EARC) ? 5 : 1;
+    for (int attempt = 0; attempt < max_tries; attempt++) {
+        int pfd = open(BYPASS_DEV, O_RDONLY);
         if (pfd >= 0) {
             close(pfd);
             return 1;
         }
+        if (errno == EACCES || errno == EPERM) {
+            pfd = open(BYPASS_DEV, O_WRONLY);
+            if (pfd >= 0) {
+                close(pfd);
+                return 1;
+            }
+        }
+        if (errno == EBUSY)
+            return 1; /* Another MAT stream is currently open -> eARC MAT ring IS active */
+        if (errno != ENODEV || attempt + 1 >= max_tries)
+            break;
+        usleep(100000); /* 100 ms */
     }
-    if (errno == EBUSY)
-        return 1; /* Another MAT stream is currently open -> eARC MAT ring IS active */
     return 0;
 }
 
@@ -1131,7 +1140,7 @@ static int shim_open_output_stream(struct audio_hw_device *dev, int handle,
         /* For raw TrueHD, run stateless O_RDONLY probe (<5 us): if eARC MAT ring is inactive
            (e.g. TV on Pass through / TV speakers / soundbar off), fall back cleanly to stock HAL.
            For IEC61937, never fall back since stock vendor HAL does not support IEC61937. */
-        if (is_truehd && !is_earc_mat_ring_available()) {
+        if (is_truehd && !is_earc_mat_ring_available(devices)) {
             ALOGW("eARC MAT ring inactive (%s) for DOLBY_TRUEHD_RAW -> falling back to stock HAL",
                   strerror(errno));
             return g_orig_open_output_stream(dev, handle, devices, flags, config, stream_out, address);
@@ -1202,6 +1211,8 @@ static void shim_close_output_stream(struct audio_hw_device *dev, struct audio_s
     if (m) {
         pthread_mutex_lock(&m->lock);
         mat_close_fd_locked(m);
+        while (m->in_write > 0)
+            pthread_cond_wait(&m->io_idle, &m->lock);
         pthread_mutex_unlock(&m->lock);
         m->magic = 0;
         pthread_cond_destroy(&m->io_idle);
