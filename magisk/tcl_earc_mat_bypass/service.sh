@@ -46,4 +46,10 @@ LOG="$MODDIR/boot.log"
     else
         echo "ERROR: /dev/earc_mat_bypass missing"
     fi
+
+    # Start eARC auto-recovery watchdog (recovers from stuck ARC_MODE after standby)
+    if [ -x "$MODDIR/earc_watchdog.sh" ]; then
+        nohup "$MODDIR/earc_watchdog.sh" >/dev/null 2>&1 &
+        echo "earc_watchdog started"
+    fi
 } > "$LOG" 2>&1
