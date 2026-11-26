@@ -1,6 +1,6 @@
 id=tcl_earc_mat_bypass
 name=TCL C9K eARC TrueHD Atmos MAT Bypass
-version=v1.0.0
-versionCode=100
+version=v1.0.1
+versionCode=101
 author=TCL eARC Research
 description=Auto-loads tcl_earc_mat.ko on boot to expose /dev/earc_mat_bypass (buffered kthread MAT 2.0 eARC TX bypass for MT5896 V670).

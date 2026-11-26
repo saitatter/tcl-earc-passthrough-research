@@ -10,10 +10,10 @@ INFO="/sys/devices/platform/mtk_earc/RD/Info"
 LOG="$MODDIR/earc_watchdog.log"
 PIDFILE="$MODDIR/earc_watchdog.pid"
 
-# Single-instance guard
+# Single-instance guard (verify cmdline to avoid stale PID reuse after reboot)
 if [ -f "$PIDFILE" ]; then
     OLD_PID="$(cat "$PIDFILE" 2>/dev/null)"
-    if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+    if [ -n "$OLD_PID" ] && [ -r "/proc/$OLD_PID/cmdline" ] && grep -q earc_watchdog "/proc/$OLD_PID/cmdline" 2>/dev/null; then
         exit 0
     fi
 fi

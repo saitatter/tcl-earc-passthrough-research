@@ -70,7 +70,7 @@ void __cfi_check(u64 id, void *ptr, void *diag) { (void)id; (void)ptr; (void)dia
 #define MAT_SYNC_W0        0x4e1ff872U   /* LE u32: Pa=0xF872, Pb=0x4E1F */
 #define MAT_SYNC_W1        0xeff00016U   /* LE u32: Pc=0x0016 (MAT), Pd=0xEFF0 (61,424 B) */
 #define MIN_VALID_SLOTS    16U
-#define REPLACE_WINDOW_NS  1500000ULL    /* 1.5 ms conservative write deadline from last sentinel observation */
+#define REPLACE_WINDOW_NS  4000000ULL    /* 4.0 ms conservative write deadline (SE DSP lags DEC-R2 by 20 ms on V670) */
 
 /* Vivaldi3 (0x950300) & eARC Digital TX cfg (0x951100) MMIO windows from runtime FDT */
 #define VIVALDI3_PHYS      0x1D2A0600ULL
@@ -343,7 +343,7 @@ static int mat_pump_thread(void *arg)
 
     int locked = g_prelocked;
     int started = 0;
-    unsigned long target_lead_us = 17500UL; /* 17.5ms initial sleep leaves 2.5ms SCHED_FIFO margin (auto-backs off on late) */
+    unsigned long target_lead_us = 15000UL; /* 15.0ms initial sleep leaves 5.0ms wake margin for zero already_ready */
 
     if (locked) {
         _printk("\0016[tcl_earc_mat] pump locked (SCHED_FIFO): base_off=0x%x next_slot=%u\n",
