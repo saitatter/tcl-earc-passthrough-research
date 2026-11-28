@@ -60,8 +60,10 @@
 #define MAX_SHIM_STREAMS             8U
 #define MAT_STREAM_MAGIC             0x4D415453U /* 'MATS' */
 
-#define KERNEL_Q_BURSTS              8U      /* matches Q_SLOTS=8 in tcl_earc_mat.c */
-#define DEFAULT_PIPE_DELAY_MS        (-120)  /* calibrated on C9K + Q85H Pro eARC */
+#define KERNEL_Q_BURSTS              32U     /* matches Q_SLOTS=32 in tcl_earc_mat.c */
+#define DEFAULT_PIPE_DELAY_MS        0       /* manual trim; the video A/V delay is added automatically */
+#define STATUS_V1_BYTES              40
+#define STATUS_V2_BYTES              48
 
 /* Bit-exact IEC61937-9 / Dolby MAT 2.0 constants (pre-swapped 16-bit LE, verified against FFmpeg spdifenc.c) */
 static const uint8_t IEC61937_MAT_HDR[8] = {
@@ -93,7 +95,7 @@ static const struct mat_code_desc MAT_CODES[3] = {
     { 61408U, sizeof(MAT_END_CODE),    MAT_END_CODE    },
 };
 
-/* Fixed-layout 40-byte status ABI returned by read(/dev/earc_mat_bypass) */
+/* Fixed-layout status ABI returned by read(/dev/earc_mat_bypass): 40 bytes (v1) or 48 bytes (v2) */
 struct earc_mat_status {
     uint64_t frames_out;
     uint64_t last_slot_mono_ns;
@@ -103,6 +105,8 @@ struct earc_mat_status {
     uint32_t relocks;
     uint32_t ring_active;
     uint32_t header_changes;
+    uint32_t av_delay_ms;        /* v2: stock A/V lip-sync delay the TV applies to PCM while video plays */
+    uint32_t reserved;
 };
 
 /* Minimal 32-bit AOSP hardware/hardware.h + hardware/audio.h ABI (verified against audio.primary.merak.so) */
@@ -219,6 +223,11 @@ struct mat_stream_out {
     uint64_t hw_consumed_bursts; /* bursts pumped into DDR by earc_mat_pump */
     uint64_t last_hw_sync_ns;    /* CLOCK_MONOTONIC ns of last pumped DDR slot */
     uint64_t session_start_ns;   /* CLOCK_MONOTONIC at first write of session */
+    uint64_t resume_ns;          /* CLOCK_MONOTONIC of last resume (interpolation floor) */
+    int      auto_av_ms;         /* stock A/V delay latched for this session */
+    int      auto_av_latched;
+    uint32_t last_k_av_delay;
+    uint32_t clamp_hits;         /* presentation clamped at written_frames (offset deeper than queue) */
     uint32_t resync_skips;       /* count of skipped bytes in TrueHD AU parser */
     uint32_t last_k_qdepth;
     uint32_t last_k_underruns;
@@ -314,6 +323,22 @@ static int mat_get_pipe_delay_ms(void)
     return DEFAULT_PIPE_DELAY_MS;
 }
 
+/* persist.tcl.earc_auto_av=0 disables following the TV's video A/V delay (default on) */
+static int mat_auto_av_enabled(void)
+{
+    char val[PROP_VALUE_MAX];
+    if (__system_property_get("persist.tcl.earc_auto_av", val) > 0)
+        return atoi(val) != 0;
+    return 1;
+}
+
+/* Positive = report less presented (audio later is assumed); negative = report audio further ahead
+   so video is rendered earlier to cover the TV's video processing delay. */
+static int mat_effective_delay_ms(const struct mat_stream_out *m)
+{
+    return mat_get_pipe_delay_ms() - (m->auto_av_latched ? m->auto_av_ms : 0);
+}
+
 static uint64_t mat_frames_per_burst(const struct mat_stream_out *m)
 {
     return m->is_raw_truehd ? (uint64_t)(m->sample_rate / 50U)
@@ -326,8 +351,19 @@ static void mat_poll_kernel_status_locked(struct mat_stream_out *m)
         return;
 
     struct earc_mat_status st;
+    memset(&st, 0, sizeof(st));
     ssize_t r = read(m->fd, &st, sizeof(st));
-    if (r == (ssize_t)sizeof(st)) {
+    if (r == (ssize_t)STATUS_V1_BYTES || r == (ssize_t)STATUS_V2_BYTES) {
+        if (r == (ssize_t)STATUS_V2_BYTES) {
+            m->last_k_av_delay = st.av_delay_ms;
+            if (!m->auto_av_latched) {
+                /* Latch per session/resume so a mid-stream change never yanks the clock backwards */
+                m->auto_av_ms = mat_auto_av_enabled() ? (int)st.av_delay_ms : 0;
+                m->auto_av_latched = 1;
+                ALOGI("auto A/V delay latched: %d ms (stock=%u trim=%d effective=%d)",
+                      m->auto_av_ms, st.av_delay_ms, mat_get_pipe_delay_ms(), mat_effective_delay_ms(m));
+            }
+        }
         m->hw_consumed_bursts = st.frames_out;
         if (st.last_slot_mono_ns != 0)
             m->last_hw_sync_ns = st.last_slot_mono_ns;
@@ -350,10 +386,15 @@ static uint64_t mat_calc_presented_locked(struct mat_stream_out *m, uint64_t now
         mat_poll_kernel_status_locked(m);
 
         uint64_t fpb = mat_frames_per_burst(m);
-        int64_t pipe_delay_frames = ((int64_t)mat_get_pipe_delay_ms() * (int64_t)m->sample_rate) / 1000LL;
+        int64_t pipe_delay_frames = ((int64_t)mat_effective_delay_ms(m) * (int64_t)m->sample_rate) / 1000LL;
         int64_t raw_frames = (int64_t)(m->hw_consumed_bursts * fpb);
-        if (m->hw_consumed_bursts > 0 && m->last_hw_sync_ns > 0 && now_ns > m->last_hw_sync_ns) {
-            uint64_t dt_ns = now_ns - m->last_hw_sync_ns;
+        /* After resume the kernel's last slot stamp predates the pause: interpolate from resume instead,
+           otherwise the clock jumps a full burst forward and then stalls. */
+        uint64_t anchor_ns = m->last_hw_sync_ns;
+        if (m->resume_ns > anchor_ns)
+            anchor_ns = m->resume_ns;
+        if (m->hw_consumed_bursts > 0 && anchor_ns > 0 && now_ns > anchor_ns) {
+            uint64_t dt_ns = now_ns - anchor_ns;
             uint64_t interp = (dt_ns * (uint64_t)m->sample_rate) / 1000000000ULL;
             if (interp > fpb)
                 interp = fpb;
@@ -364,8 +405,11 @@ static uint64_t mat_calc_presented_locked(struct mat_stream_out *m, uint64_t now
             adjusted = 0;
         pos = m->base_frames + (uint64_t)adjusted;
     }
-    if (pos > m->written_frames)
+    if (pos > m->written_frames) {
+        if (m->started && !m->paused && m->hw_consumed_bursts > 0)
+            m->clamp_hits++;
         pos = m->written_frames;
+    }
     if (pos < m->last_presented)
         pos = m->last_presented;
     m->last_presented = pos;
@@ -400,6 +444,8 @@ static void mat_close_fd_locked(struct mat_stream_out *m)
     m->hw_consumed_bursts = 0;
     m->last_hw_sync_ns = 0;
     m->session_start_ns = 0;
+    m->resume_ns = 0;
+    m->auto_av_latched = 0;
     m->last_k_qdepth = 0;
     /* Do NOT wipe mat_buf/thd_acc/timing state on pause/standby: AudioTrack resumes mid-AU without flushing!
        mat_reset_packer_locked() is called only on mat_flush() (seek/stop) or mat_drain() completion. */
@@ -425,10 +471,13 @@ static int mat_write_all_locked(struct mat_stream_out *m, const uint8_t *p, size
         m->fd = fd_open;
         m->can_read_status = can_read;
         m->session_start_ns = now_monotonic_ns();
+        m->auto_av_latched = 0;
+        m->clamp_hits = 0;
         ALOGI("opened %s (%s) for %s stream (rate=%u ch=0x%x base=%llu)",
               BYPASS_DEV, can_read ? "O_RDWR" : "O_WRONLY",
               m->is_raw_truehd ? "TRUEHD_RAW->MAT" : "IEC61937_MAT",
               m->sample_rate, m->channel_mask, (unsigned long long)m->base_frames);
+        mat_poll_kernel_status_locked(m); /* latch the A/V delay before the first position query */
     }
 
     int fd = m->fd;
@@ -474,7 +523,7 @@ static int mat_write_all_locked(struct mat_stream_out *m, const uint8_t *p, size
             uint64_t wall_ms = (now_ns > m->session_start_ns) ? ((now_ns - m->session_start_ns) / 1000000ULL) : 0ULL;
             uint64_t aud_ms = m->session_bursts * 20ULL;
             uint64_t pres = mat_calc_presented_locked(m, now_ns);
-            ALOGI("sync-diag: bursts=%llu k_out=%llu q=%u aud_ms=%llu wall_ms=%llu pres=%llu skips=%u u=%u late=%u",
+            ALOGI("sync-diag: bursts=%llu k_out=%llu q=%u aud_ms=%llu wall_ms=%llu pres=%llu skips=%u u=%u late=%u av=%d/%u eff=%d clamp=%u",
                   (unsigned long long)m->session_bursts,
                   (unsigned long long)m->hw_consumed_bursts,
                   m->last_k_qdepth,
@@ -483,7 +532,9 @@ static int mat_write_all_locked(struct mat_stream_out *m, const uint8_t *p, size
                   (unsigned long long)pres,
                   m->resync_skips,
                   m->last_k_underruns,
-                  m->last_k_late);
+                  m->last_k_late,
+                  m->auto_av_ms, m->last_k_av_delay,
+                  mat_effective_delay_ms(m), m->clamp_hits);
         }
     }
     return 0;
@@ -675,9 +726,14 @@ static int mat_pack_truehd_au_locked(struct mat_stream_out *m, const uint8_t *au
             int disc_padding = (prev_oi_delta - curr_oi_delta) * bytes_per_sample;
 
             output_discontinuity = 1;
-            padding_remaining = prev_padding + disc_padding;
+            int raw_padding = prev_padding + disc_padding;
+            padding_remaining = raw_padding;
             if (padding_remaining < 0 || padding_remaining > max_padding)
                 padding_remaining = 0;
+            ALOGI("thd-disc: bursts=%u au_len=%zu exp_out=%u act_out=%u in=%u prev_oi=%d curr_oi=%d prev_pad=%d disc_pad=%d raw_pad=%d pad=%d",
+                  m->mat_bursts_emitted, au_len, (unsigned)m->thd_output_timing, (unsigned)au.output_timing,
+                  (unsigned)input_timing, prev_oi_delta, curr_oi_delta, prev_padding, disc_padding,
+                  raw_padding, padding_remaining);
         }
         m->thd_output_timing = au.output_timing;
         m->thd_output_timing_valid = 1;
@@ -686,9 +742,16 @@ static int mat_pack_truehd_au_locked(struct mat_stream_out *m, const uint8_t *au
     if (m->thd_prev_size > 0 && !output_discontinuity) {
         uint16_t delta_samples = (uint16_t)(input_timing - m->thd_prev_time);
         int delta_bytes = ((int)delta_samples * (int)TRUEHD_NOMINAL_AU_SPACING) / m->thd_samples_per_frame;
-        padding_remaining = delta_bytes - m->thd_prev_size;
+        int raw_padding = delta_bytes - m->thd_prev_size;
+        padding_remaining = raw_padding;
         if (padding_remaining < 0 || padding_remaining > max_padding)
             padding_remaining = 0;
+        if (raw_padding < 0 || raw_padding > max_padding ||
+            delta_samples > (uint16_t)(m->thd_samples_per_frame * 8)) {
+            ALOGI("thd-jump: bursts=%u au_len=%zu prev_in=%u in=%u delta_smp=%u prev_sz=%d raw_pad=%d pad=%d has_out=%d",
+                  m->mat_bursts_emitted, au_len, (unsigned)m->thd_prev_time, (unsigned)input_timing,
+                  (unsigned)delta_samples, m->thd_prev_size, raw_padding, padding_remaining, au.has_output_timing);
+        }
     }
 
     if (m->thd_output_timing_valid) {
@@ -897,8 +960,10 @@ static int mat_dump(const struct audio_stream *s, int fd)
     uint64_t pres = mat_calc_presented_locked(m, now_monotonic_ns());
     dprintf(fd, "  TCL eARC MAT Bypass Stream (%s):\n",
             m->is_raw_truehd ? "DOLBY_TRUEHD_RAW -> MAT 2.0" : "IEC61937_MAT");
-    dprintf(fd, "    rate=%u ch=0x%x fd=%d started=%d sync_offset_ms=%d\n",
-            m->sample_rate, m->channel_mask, m->fd, m->started, mat_get_pipe_delay_ms());
+    dprintf(fd, "    rate=%u ch=0x%x fd=%d started=%d sync_offset_ms=%d auto_av_ms=%d (stock now %u) effective_ms=%d clamp_hits=%u\n",
+            m->sample_rate, m->channel_mask, m->fd, m->started, mat_get_pipe_delay_ms(),
+            m->auto_av_latched ? m->auto_av_ms : 0, m->last_k_av_delay, mat_effective_delay_ms(m),
+            m->clamp_hits);
     dprintf(fd, "    written_frames=%llu presented_frames=%llu mat_bursts=%u skips=%u\n",
             (unsigned long long)m->written_frames, (unsigned long long)pres,
             m->mat_bursts_emitted, m->resync_skips);
@@ -943,12 +1008,20 @@ static uint32_t mat_get_latency(const struct audio_stream_out *s)
 {
     struct mat_stream_out *m = (struct mat_stream_out *)s;
     pthread_mutex_lock(&m->lock);
-    mat_poll_kernel_status_locked(m);
-    unsigned depth = m->fd < 0 ? 0 : KERNEL_Q_BURSTS;
-    if (m->fd >= 0 && m->can_read_status && m->last_k_qdepth <= KERNEL_Q_BURSTS)
-        depth = m->last_k_qdepth;
+    int total;
+    if (m->started && m->sample_rate > 0) {
+        /* Same clock as get_presentation_position: time from write to reported presentation */
+        uint64_t pres = mat_calc_presented_locked(m, now_monotonic_ns());
+        uint64_t ahead = m->written_frames > pres ? m->written_frames - pres : 0;
+        total = (int)((ahead * 1000ULL) / m->sample_rate);
+    } else {
+        mat_poll_kernel_status_locked(m);
+        unsigned depth = m->fd < 0 ? 0 : KERNEL_Q_BURSTS;
+        if (m->fd >= 0 && m->can_read_status && m->last_k_qdepth <= KERNEL_Q_BURSTS)
+            depth = m->last_k_qdepth;
+        total = (int)(depth * 20U) + mat_effective_delay_ms(m);
+    }
     pthread_mutex_unlock(&m->lock);
-    int total = (int)(depth * 20U) + mat_get_pipe_delay_ms();
     return total > 0 ? (uint32_t)total : 0;
 }
 static int mat_set_volume(struct audio_stream_out *s, float l, float r)
@@ -1020,6 +1093,11 @@ static int mat_resume(struct audio_stream_out *s)
     int rc = 0;
     if (m->paused && m->fd >= 0 && ioctl(m->fd, EARC_MAT_RESUME, 0) < 0)
         rc = -errno;
+    if (!rc && m->paused) {
+        m->resume_ns = now_monotonic_ns();
+        m->auto_av_latched = 0; /* pick up an A/V delay that changed while paused */
+        mat_poll_kernel_status_locked(m);
+    }
     if (!rc)
         m->paused = 0;
     pthread_mutex_unlock(&m->lock);

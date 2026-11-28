@@ -7,7 +7,10 @@
  *   (verifies Vivaldi RIU eARC NPCM2 mux + Non-PCM + unmute + multi-slot MAT 2.0 headers
  *   without touching DDR or spawning a kthread; never conflicts with active writer).
  * - O_WRONLY / O_RDWR open: exclusive streaming session (atomic g_open guard) with:
- *   - 8-frame (160 ms) lock-free SPSC jitter buffer + binary completion wakeup (no done-counter spin).
+ *   - 32-frame (640 ms) lock-free SPSC jitter buffer + binary completion wakeup (no done-counter spin).
+ *     The depth lets the HAL report presentation up to ~600 ms ahead of the DDR write point, which
+ *     is needed to match the TV's video pipeline (A/V) delay without clamping at frames written.
+ *   - Read-only SND-R2 SHM mapping: exports the stock A/V lip-sync channel delay (ms) in telemetry.
  *   - PAN-safe f_op->write_iter (_copy_from_iter) and lock-free f_op->read_iter (_copy_to_iter)
  *     with FMODE_STREAM (no f_pos_lock contention between concurrent write() and read()).
  *   - f_op->fsync for lossless end-of-stream drain (waits until SPSC queue is committed to DDR).
@@ -82,8 +85,17 @@ void __cfi_check(u64 id, void *ptr, void *diag) { (void)id; (void)ptr; (void)dia
 #define EARC_CFG_SIZE      0x00000200ULL
 #define EARC_CFG10_HI      0x029U        /* RIU 0x951115: bits [6:4] = 0x20 (SE DSP NPCM2) */
 
-#define Q_SLOTS            8U            /* 8 * 20 ms = 160 ms SPSC jitter buffer (power of 2) */
+#define Q_SLOTS            32U           /* 32 * 20 ms = 640 ms SPSC jitter buffer (power of 2) */
 #define Q_MASK             (Q_SLOTS - 1U)
+
+/* SND-R2 shared memory (MI_MAD_ADV_BUF 0x20200000 + 0x01913000, located live on V670).
+ * HAL_SND_R2_Set_SHM_PARAM stores the per-channel A/V delays the stock HAL applies when video
+ * starts (HAL_SND_SetParam "chN delay"): id 0xC9 (ch1) at +0x198, id 0xCB (ch6) at +0x1A0. */
+#define SND_R2_SHM_PHYS    0x21B13000ULL
+#define SND_R2_SHM_SIZE    0x00001000ULL
+#define SHM_CH1_DELAY      0x198U
+#define SHM_CH6_DELAY      0x1A0U
+#define AV_DELAY_MAX_MS    1000U
 
 #define TASK_UNINTERRUPTIBLE 2U
 #define TASK_IDLE            0x402U      /* TASK_UNINTERRUPTIBLE | TASK_NOLOAD */
@@ -97,7 +109,8 @@ void __cfi_check(u64 id, void *ptr, void *diag) { (void)id; (void)ptr; (void)dia
 #define FMODE_STREAM_SET   0x00200000U
 #define FMODE_STREAM_CLR   0xFFDF7FE3U   /* clears FMODE_LSEEK|PREAD|PWRITE|ATOMIC_POS */
 
-/* Fixed-layout status ABI shared between 64-bit kernel and 32-bit Audio HAL shim (40 bytes) */
+/* Fixed-layout status ABI shared between 64-bit kernel and 32-bit Audio HAL shim (48 bytes).
+ * Readers that request only the first 40 bytes keep working. */
 struct earc_mat_status {
     u64 frames_out;
     u64 last_slot_mono_ns;
@@ -107,9 +120,12 @@ struct earc_mat_status {
     u32 relocks;
     u32 ring_active;
     u32 header_changes;
+    u32 av_delay_ms;
+    u32 reserved;
 };
 
 static volatile u8 *g_ring;
+static volatile u32 *g_snd_shm;
 static volatile u8 *g_riu_vivaldi3;
 static volatile u8 *g_riu_earc_cfg;
 static u8 *g_q_buf;
@@ -605,6 +621,20 @@ static int dev_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
     return 0;
 }
 
+/* Stock A/V delay applied to PCM outputs while video plays (0 when idle or unmapped) */
+static u32 read_stock_av_delay_ms(void)
+{
+    if (!g_snd_shm)
+        return 0;
+    u32 ch1 = g_snd_shm[SHM_CH1_DELAY / 4U];
+    u32 ch6 = g_snd_shm[SHM_CH6_DELAY / 4U];
+    if (ch1 > AV_DELAY_MAX_MS)
+        ch1 = 0;
+    if (ch6 > AV_DELAY_MAX_MS)
+        ch6 = 0;
+    return ch6 > ch1 ? ch6 : ch1;
+}
+
 static ssize_t dev_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
     (void)iocb;
@@ -620,6 +650,8 @@ static ssize_t dev_read_iter(struct kiocb *iocb, struct iov_iter *to)
     st.relocks           = __atomic_load_n(&g_relocks, __ATOMIC_RELAXED);
     st.ring_active       = (__atomic_load_n(&g_thread_alive, __ATOMIC_ACQUIRE) && earc_hw_npcm_active()) ? 1U : 0U;
     st.header_changes    = __atomic_load_n(&g_header_changes, __ATOMIC_RELAXED);
+    st.av_delay_ms       = read_stock_av_delay_ms();
+    st.reserved          = 0;
 
     size_t copied = _copy_to_iter(&st, sizeof(st), to);
     return (ssize_t)copied;
@@ -758,9 +790,11 @@ int init_module(void)
 
     g_riu_vivaldi3 = (volatile u8 *)__ioremap(VIVALDI3_PHYS, VIVALDI3_SIZE, prot_dev);
     g_riu_earc_cfg = (volatile u8 *)__ioremap(EARC_CFG_PHYS, EARC_CFG_SIZE, prot_dev);
+    g_snd_shm = (volatile u32 *)__ioremap(SND_R2_SHM_PHYS, SND_R2_SHM_SIZE, prot_nc);
 
     g_q_buf = (u8 *)vmalloc((u64)Q_SLOTS * SLOT_SIZE);
     if (!g_q_buf) {
+        if (g_snd_shm) { iounmap(g_snd_shm); g_snd_shm = 0; }
         if (g_riu_earc_cfg) { iounmap(g_riu_earc_cfg); g_riu_earc_cfg = 0; }
         if (g_riu_vivaldi3) { iounmap(g_riu_vivaldi3); g_riu_vivaldi3 = 0; }
         iounmap(g_ring);
@@ -776,6 +810,7 @@ int init_module(void)
     int rc = misc_register(&earc_miscdev);
     if (rc) {
         vfree(g_q_buf);
+        if (g_snd_shm) { iounmap(g_snd_shm); g_snd_shm = 0; }
         if (g_riu_earc_cfg) { iounmap(g_riu_earc_cfg); g_riu_earc_cfg = 0; }
         if (g_riu_vivaldi3) { iounmap(g_riu_vivaldi3); g_riu_vivaldi3 = 0; }
         iounmap(g_ring);
@@ -784,8 +819,8 @@ int init_module(void)
         return rc;
     }
 
-    _printk("\0016[tcl_earc_mat] READY: /dev/earc_mat_bypass (queue=%u frames / %ums, riu_guard=%d)\n",
-            Q_SLOTS, Q_SLOTS * 20U, (g_riu_vivaldi3 && g_riu_earc_cfg) ? 1 : 0);
+    _printk("\0016[tcl_earc_mat] READY: /dev/earc_mat_bypass (queue=%u frames / %ums, riu_guard=%d, av_delay=%u ms)\n",
+            Q_SLOTS, Q_SLOTS * 20U, (g_riu_vivaldi3 && g_riu_earc_cfg) ? 1 : 0, read_stock_av_delay_ms());
     return 0;
 }
 
@@ -796,6 +831,10 @@ void cleanup_module(void)
     if (g_q_buf) {
         vfree(g_q_buf);
         g_q_buf = 0;
+    }
+    if (g_snd_shm) {
+        iounmap(g_snd_shm);
+        g_snd_shm = 0;
     }
     if (g_riu_earc_cfg) {
         iounmap(g_riu_earc_cfg);

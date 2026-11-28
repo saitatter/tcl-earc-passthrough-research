@@ -15,7 +15,7 @@ module (`/data/adb/modules/tcl_earc_mat_bypass/`):
   DDR ring (`0x2249C000..0x22640000`, `28 × 61,440` bytes = `560 ms`) every `20.000 ms`, and `SE DSP` continuously
   streams that ring to `eARC TX` (`0x951115 = 0x25`). Our bypass skips `DEC-R2` completely and feeds untouched TrueHD
   Atmos MAT 2.0 bursts directly into that ring.
-- **Kernel driver ([`native/tcl_earc_mat.c`](native/tcl_earc_mat.c) → `/dev/earc_mat_bypass`):** 8-frame (`160 ms`)
+- **Kernel driver ([`native/tcl_earc_mat.c`](native/tcl_earc_mat.c) → `/dev/earc_mat_bypass`):** 32-frame (`640 ms`)
   lock-free SPSC jitter buffer with binary completion wakeup, `fsync` end-of-stream drain, non-exclusive `O_RDONLY`
   probe/telemetry (`frames_out` + `ktime_get()` monotonic timestamps), Vivaldi RIU + multi-slot MAT ring guards, and a
   dedicated `SCHED_FIFO` `kthread` (`earc_mat_pump`) phase-locked to `DEC-R2`'s live 20.000 ms slot cadence.

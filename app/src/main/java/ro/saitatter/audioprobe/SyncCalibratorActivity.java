@@ -75,7 +75,7 @@ public final class SyncCalibratorActivity extends Activity implements Choreograp
     private TextView headerView, statusView, tapLogView;
     private Button tapBtn, applyBtn;
 
-    private int currentOffsetMs = -120;
+    private int currentOffsetMs = 0;
     private final int[] tapErrors = new int[MAX_TAPS];
     private int tapCount = 0;
     private int lastTapErrorMs = 0;
@@ -177,7 +177,7 @@ public final class SyncCalibratorActivity extends Activity implements Choreograp
         try {
             if (v != null && !v.isEmpty()) return Integer.parseInt(v.trim());
         } catch (NumberFormatException ignored) {}
-        return -120;
+        return 0;
     }
 
     private void applyOffsetMs(int newMs) {
